@@ -4,3 +4,4 @@
 .json
 .zip
 code/__pycache__/
+*.ocsf.json

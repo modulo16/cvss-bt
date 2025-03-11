@@ -1,0 +1,140 @@
+name: Run Enrichment Process
+
+on:
+  workflow_run:
+    workflows: ["Check for new EPSS data"]
+    types:
+      - completed
+  workflow_dispatch:
+    inputs:
+      ocsf_file:
+        description: 'OCSF file path (optional)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' }}
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v2
+
+    - name: Set up Python
+      uses: actions/setup-python@v2
+      with:
+        python-version: '3.11'
+
+    - name: Install dependencies
+      run: |
+        pip install -r code/requirements.txt
+
+    - name: Grab Needed Data
+      env:
+        VULNCHECK_API_KEY: ${{ secrets.VULNCHECK_API_KEY }}
+      run: |
+        rm -f *.zip
+        RESPONSE=$(curl --request GET \
+          --url https://api.vulncheck.com/v3/backup/nist-nvd \
+          --header 'Accept: application/json' \
+          --header "Authorization: Bearer $VULNCHECK_API_KEY")
+        url=$(echo "$RESPONSE" | jq -r '.data[0].url')
+        curl -L -o nvd.zip $url
+        unzip -o "*.zip"
+        rm -f *.zip
+    
+    - name: Check for OCSF file
+      id: check_ocsf
+      run: |
+        if [ -n "${{ github.event.inputs.ocsf_file }}" ] && [ -f "${{ github.event.inputs.ocsf_file }}" ]; then
+          echo "OCSF file found at ${{ github.event.inputs.ocsf_file }}"
+          echo "ocsf_file_exists=true" >> $GITHUB_ENV
+          echo "ocsf_file_path=${{ github.event.inputs.ocsf_file }}" >> $GITHUB_ENV
+        else
+          echo "No OCSF file specified or file not found"
+          echo "ocsf_file_exists=false" >> $GITHUB_ENV
+          echo "ocsf_file_path=" >> $GITHUB_ENV
+        fi
+
+    - name: Run Enrichment Process
+      env:
+        VULNCHECK_API_KEY: ${{ secrets.VULNCHECK_API_KEY }}
+      run: |
+        if [ "${{ env.ocsf_file_exists }}" = "true" ]; then
+          echo "Running enrichment process with OCSF file"
+          python -u code/process_nvd_enhanced.py --ocsf "${{ env.ocsf_file_path }}"
+        else
+          echo "Running standard enrichment process without OCSF file"
+          python -u code/process_nvd.py
+        fi
+
+    - name: setup git config
+      run: |
+        git config user.name "GitHub Actions Bot"
+        git config user.email "<>"
+    
+    - name: Generate tag
+      id: generate_tag
+      run: echo "tag=v$(date +%Y.%m.%d)" >> $GITHUB_ENV
+
+    - name: Commit and push if there are changes
+      run: |
+        git add cvss-bt.csv code/last_run.txt
+        
+        if [ "${{ env.ocsf_file_exists }}" = "true" ]; then
+          git add cvss-bte.csv asset_vulnerability_matrix.csv
+        fi
+        
+        git commit -m "Updated CVSS-BT data $(date +%Y-%m-%d)" -a || exit 0
+        git push origin HEAD:main
+        git tag -a "$tag" -m "Updated CVSS-BT data $(date +%Y-%m-%d)"
+        git push origin "$tag"
+
+    - name: Create Release
+      id: create_release
+      uses: actions/create-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ env.tag }}
+        release_name: Release ${{ env.tag }}
+        draft: false
+        prerelease: false
+    
+    - name: Upload Base-Temporal Asset
+      id: upload-bt-asset 
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
+        asset_path: ./cvss-bt.csv
+        asset_name: cvss-bt.csv
+        asset_content_type: text/plain
+    
+    - name: Upload Base-Temporal-Environmental Asset
+      if: env.ocsf_file_exists == 'true'
+      id: upload-bte-asset 
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
+        asset_path: ./cvss-bte.csv
+        asset_name: cvss-bte.csv
+        asset_content_type: text/plain
+    
+    - name: Upload Asset Vulnerability Matrix
+      if: env.ocsf_file_exists == 'true'
+      id: upload-matrix-asset 
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
+        asset_path: ./asset_vulnerability_matrix.csv
+        asset_name: asset_vulnerability_matrix.csv
+        asset_content_type: text/plain
